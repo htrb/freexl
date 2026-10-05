@@ -136,6 +136,59 @@ xmlCharDataSheet (void *data, const XML_Char * s, int len)
     worksheet->CharDataLen += len;
 }
 
+static void
+string_buffer_init (string_buffer *buf)
+{
+  buf->str = NULL;
+  buf->len = 0;
+  buf->slen = 0;
+}
+
+static void
+string_buffer_free (string_buffer *buf)
+{
+  if (buf->str)
+    free (buf->str);
+  string_buffer_init (buf);
+}
+
+static void
+string_buffer_clear (string_buffer *buf)
+{
+  if (buf->str)
+    buf->str[0] = '\0';
+  buf->slen = 0;
+}
+
+static void
+string_buffer_append_string (string_buffer *buf, const char *t)
+{
+  int len;
+  if (t == NULL)
+    return;
+
+  len = strlen (t) + 1;
+  if (buf->str == NULL)
+    {
+      buf->str = strdup (t);
+      buf->len = len;
+      buf->slen = len - 1;
+      return;
+    }
+  if (buf->len < buf->slen + len)
+    {
+      char * tmp;
+      tmp = realloc (buf->str, buf->slen + len);
+      if (tmp == NULL)
+	return;
+
+      buf->str = tmp;
+    }
+  buf->len = buf->slen + len;
+  strcpy (buf->str + buf->slen, t);
+  buf->slen += len - 1;
+}
+
 static xlsx_workbook *
 alloc_workbook ()
 {
@@ -146,6 +199,7 @@ alloc_workbook ()
     wb->first = NULL;
     wb->last = NULL;
     wb->active_sheet = NULL;
+    wb->relation_first = NULL;
     wb->n_strings = 0;
     wb->xml_strings = 0;
     wb->strings = NULL;
@@ -161,6 +215,7 @@ alloc_workbook ()
     wb->SharedStringsZipEntry = NULL;
     wb->WorkbookZipEntry = NULL;
     wb->StylesZipEntry = NULL;
+    wb->WorksheetFileEntry = NULL;
     wb->CharDataStep = 65536;
     wb->CharDataMax = wb->CharDataStep;
     wb->CharData = malloc (wb->CharDataStep);
@@ -170,6 +225,7 @@ alloc_workbook ()
     wb->StylesOk = 0;
     wb->FormatsOk = 0;
     wb->CellStylesOk = 0;
+    string_buffer_init (&wb->shared_string);
     return wb;
 }
 
@@ -186,6 +242,8 @@ destroy_row (xlsx_row * row)
     while (col != NULL)
       {
 	  col_n = col->next;
+	  if (col->str)
+	    free (col->str);
 	  free (col);
 	  col = col_n;
       }
@@ -210,10 +268,13 @@ destroy_worksheet (xlsx_worksheet * ws)
       }
     if (ws->name != NULL)
 	free (ws->name);
+    if (ws->rid != NULL)
+	free (ws->rid);
     if (ws->rows != NULL)
 	free (ws->rows);
     if (ws->CharData != NULL)
 	free (ws->CharData);
+    string_buffer_free (&ws->inline_string);
     free (ws);
 }
 
@@ -225,6 +286,8 @@ destroy_workbook (xlsx_workbook * wb)
     xlsx_worksheet *ws_n;
     xml_datetime *date;
     xml_datetime *date_n;
+    xlsx_file_relation *rel;
+    xlsx_file_relation *rel_n;
     if (wb == NULL)
 	return;
 
@@ -234,6 +297,17 @@ destroy_workbook (xlsx_workbook * wb)
 	  ws_n = ws->next;
 	  destroy_worksheet (ws);
 	  ws = ws_n;
+      }
+    rel = wb->relation_first;
+    while (rel != NULL)
+      {
+	rel_n = rel->next;
+	if (rel->rid)
+	  free (rel->rid);
+	if (rel->filename)
+	  free (rel->filename);
+	free (rel);
+	rel = rel_n;
       }
     date = wb->first_date;
     while (date != NULL)
@@ -263,8 +337,11 @@ destroy_workbook (xlsx_workbook * wb)
 	free (wb->WorkbookZipEntry);
     if (wb->StylesZipEntry != NULL)
 	free (wb->StylesZipEntry);
+    if (wb->WorksheetFileEntry != NULL)
+	free (wb->WorksheetFileEntry);
     if (wb->CharData != NULL)
 	free (wb->CharData);
+    string_buffer_free (&wb->shared_string);
     free (wb);
 }
 
@@ -319,6 +396,11 @@ do_list_zipfile_dir (unzFile uf, xlsx_workbook * workbook)
 	    {
 		/* found Styles */
 		workbook->StylesZipEntry = setString (filename);
+	    }
+	  if (strcasecmp (filename, "xl/_rels/workbook.xml.rels") == 0)
+	    {
+		/* found Styles */
+		workbook->WorksheetFileEntry = setString (filename);
 	    }
 
 	  if (i == gi.number_entry - 1)
@@ -427,6 +509,7 @@ add_xlsx_col (xlsx_worksheet * worksheet, int col_no, int type, int is_datetime)
     cell->type = type;
     cell->is_datetime = is_datetime;
     cell->assigned = 0;
+    cell->str = NULL;
     cell->next = NULL;
 
     if (row->first == NULL)
@@ -504,6 +587,7 @@ sheet_start_tag (void *data, const char *el, const char **attr)
       }
     if (strcmp (el, "c") == 0)
       {
+	  string_buffer_clear (&worksheet->inline_string);
 	  if (worksheet->RowOk == 3)
 	    {
 		const char *r = NULL;
@@ -552,6 +636,10 @@ sheet_start_tag (void *data, const char *el, const char **attr)
 			     */
 			    if (strcmp (t, "n") == 0)
 				type = XLSX_INTEGER;
+			    if (strcmp (t, "str") == 0)
+				type = XLSX_STR;
+			    if (strcmp (t, "inlineStr") == 0)
+				type = XLSX_STR;
 			}
 		      add_xlsx_col (worksheet, col_no, type, is_datetime);
 		      worksheet->ColOk = 1;
@@ -591,6 +679,11 @@ set_xlsx_cell_value (xlsx_worksheet * worksheet, const char *val)
 	  cell->type = XLSX_INTEGER;
       }
 
+    if (cell->type == XLSX_STR)
+      {
+	  cell->str = strdup (val);
+	  cell->assigned = 1;
+      }
     if (cell->type == XLSX_STR_INDEX)
       {
 	  cell->str_index = atoi (val);
@@ -657,6 +750,21 @@ sheet_end_tag (void *data, const char *el)
 	  else
 	      worksheet->error = 1;
       }
+    if (strcmp (el, "t") == 0)
+      {
+	const char *in;
+	*(worksheet->CharData + worksheet->CharDataLen) = '\0';
+	in = worksheet->CharData;
+	string_buffer_append_string (&worksheet->inline_string, in);
+      }
+    if (strcmp (el, "is") == 0)
+    {
+      if (worksheet->inline_string.str && worksheet->inline_string.str[0])
+      {
+	set_xlsx_cell_value (worksheet, worksheet->inline_string.str);
+      }
+      string_buffer_clear (&worksheet->inline_string);
+    }
 }
 
 static void
@@ -705,7 +813,25 @@ do_parse_worksheet (xlsx_worksheet * worksheet, unsigned char *buf,
 }
 
 static void
-do_fetch_worksheet (unzFile uf, xlsx_worksheet * worksheet)
+check_zip_entry (char * zip_entry, xlsx_worksheet * worksheet, xlsx_workbook *wb)
+{
+  xlsx_file_relation *rel;
+  if (wb->relation_first != NULL && worksheet->rid != NULL)
+    {
+      for (rel = wb->relation_first; rel; rel = rel->next)
+	{
+	  if (strcmp (worksheet->rid, rel->rid) == 0)
+	    {
+	      sprintf (zip_entry, "xl/%s", rel->filename);
+	      return;
+	    }
+	}
+    }
+  sprintf (zip_entry, "xl/worksheets/sheet%d.xml", worksheet->id);
+}
+
+static void
+do_fetch_worksheet (unzFile uf, xlsx_worksheet * worksheet, xlsx_workbook * wb)
 {
 /* uncompressing SheetN.xml */
     int err;
@@ -717,7 +843,7 @@ do_fetch_worksheet (unzFile uf, xlsx_worksheet * worksheet)
     uint64_t rd_cnt;
     uint64_t unrd_cnt;
     char *zip_entry = malloc (strlen ("xl/worksheets/sheet123456789.xml") + 1);
-    sprintf (zip_entry, "xl/worksheets/sheet%d.xml", worksheet->id);
+    check_zip_entry (zip_entry, worksheet, wb);
 
     err = unzLocateFile (uf, zip_entry, 0);
     if (err != UNZ_OK)
@@ -775,11 +901,12 @@ do_fetch_worksheet (unzFile uf, xlsx_worksheet * worksheet)
 }
 
 static void
-do_add_worksheet (xlsx_workbook * workbook, int id, char *name)
+do_add_worksheet (xlsx_workbook * workbook, int id, char *rid, char *name)
 {
 /* adding a Worksheet to the Workbook */
     xlsx_worksheet *ws = malloc (sizeof (xlsx_worksheet));
     ws->id = id;
+    ws->rid = rid;
     ws->name = name;
     ws->first = NULL;
     ws->last = NULL;
@@ -795,6 +922,7 @@ do_add_worksheet (xlsx_workbook * workbook, int id, char *name)
     ws->ColOk = 0;
     ws->wbRef = workbook;
     ws->next = NULL;
+    string_buffer_init (&ws->inline_string);
     if (workbook->first == NULL)
 	workbook->first = ws;
     if (workbook->last != NULL)
@@ -824,6 +952,7 @@ worksheets_start_tag (void *data, const char *el, const char **attr)
       {
 	  int id = -1;
 	  char *name = NULL;
+	  char *rid = NULL;
 	  if (workbook->WorksheetsOk != 2)
 	    {
 		workbook->error = 1;
@@ -836,6 +965,8 @@ worksheets_start_tag (void *data, const char *el, const char **attr)
 		else
 		  {
 		      v = *attrib;
+		      if (strcmp (k, "r:id") == 0)
+			  rid = setString (v);
 		      if (strcmp (k, "sheetId") == 0)
 			  id = atoi (v);
 		      if (strcmp (k, "name") == 0)
@@ -845,7 +976,7 @@ worksheets_start_tag (void *data, const char *el, const char **attr)
 		count++;
 	    }
 	  if (id > 0 && name != NULL)
-	      do_add_worksheet (workbook, id, name);
+	      do_add_worksheet (workbook, id, rid, name);
 	  else
 	    {
 		if (name != NULL)
@@ -1000,6 +1131,8 @@ shared_strings_start_tag (void *data, const char *el, const char **attr)
 	    }
 	  workbook->SharedStringsOk = 1;
       }
+    if (strcmp (el, "rPh") == 0)
+      workbook->in_rph = 1;
     *(workbook->CharData) = '\0';
     workbook->CharDataLen = 0;
 }
@@ -1015,6 +1148,11 @@ shared_strings_end_tag (void *data, const char *el)
 	      workbook->error = 1;
 	  workbook->SharedStringsOk = 0;
       }
+    if (workbook->in_rph == 0 && strcmp (el, "t") == 0)
+      {
+	*(workbook->CharData + workbook->CharDataLen) = '\0';
+	string_buffer_append_string (&workbook->shared_string, workbook->CharData);
+      }
     if (strcmp (el, "si") == 0)
       {
 	  if (workbook->SharedStringsOk == 0)
@@ -1024,17 +1162,27 @@ shared_strings_end_tag (void *data, const char *el)
 	    }
 	  if (workbook->xml_strings < workbook->n_strings)
 	    {
+	      if (workbook->shared_string.slen > 0)
+		{
+		  *(workbook->strings + workbook->xml_strings) = strdup (workbook->shared_string.str);
+		  string_buffer_clear (&workbook->shared_string);
+		}
+	      else
+		{
 		char *in;
 		*(workbook->CharData + workbook->CharDataLen) = '\0';
 		in = workbook->CharData;
 		*(workbook->strings + workbook->xml_strings) =
 		    malloc (strlen (in) + 1);
 		strcpy (*(workbook->strings + workbook->xml_strings), in);
+		}
 		workbook->xml_strings += 1;
 	    }
 	  else
 	      workbook->error = 1;
       }
+    if (strcmp (el, "rPh") == 0)
+      workbook->in_rph = 0;
 }
 
 static void
@@ -1052,6 +1200,7 @@ do_parse_xlsx_shared_strings (xlsx_workbook * workbook, unsigned char *buf,
 	  return;
       }
 
+    workbook->in_rph = 0;
     XML_SetUserData (parser, workbook);
     XML_SetElementHandler (parser, shared_strings_start_tag,
 			   shared_strings_end_tag);
@@ -1135,8 +1284,21 @@ parse_xlsx_format (const char *code)
     int is_time = 0;
     int i;
     int len = strlen (code);
+    int ignore = 0;
     for (i = 0; i < len; i++)
       {
+	  if (code[i] == '[')
+	    {
+	      ignore = 1;
+	      continue;
+	    }
+	  if (code[i] == ']')
+	    {
+	      ignore = 0;
+	      continue;
+	    }
+	  if (ignore)
+	    continue;
 	  if (code[i] == 'd' || code[i] == 'm' || code[i] == 'y')
 	      is_date = 1;
 	  if (code[i] == 'h' || code[i] == 's')
@@ -1441,6 +1603,151 @@ do_fetch_xlsx_styles (unzFile uf, xlsx_workbook * workbook)
 	unzCloseCurrentFile (uf);
 }
 
+static void
+worksheet_file_start_tag (void *data, const char *el, const char **attr)
+{
+/* some generic XML tag starts here */
+    const char **attrib = attr;
+    int count = 0;
+    const char *k;
+    const char *v;
+    xlsx_workbook *workbook = (xlsx_workbook *) data;
+    if (strcmp (el, "Relationship") == 0)
+      {
+	  xlsx_file_relation relation;
+	  relation.rid = relation.filename = NULL;
+	  while (*attrib != NULL)
+	    {
+		if ((count % 2) == 0)
+		    k = *attrib;
+		else
+		  {
+		      v = *attrib;
+		      if (strcmp (k, "Id") == 0)
+			  relation.rid = strdup (v);
+		      if (strcmp (k, "Target") == 0)
+			  relation.filename = strdup (v);
+		  }
+		attrib++;
+		count++;
+	    }
+	  if (relation.rid && relation.filename)
+	    {
+		xlsx_file_relation *rel;
+		rel = malloc (sizeof (*rel));
+		if (rel)
+		{
+		  * rel = relation;
+		  rel->next = NULL;
+		  if (workbook->relation_first)
+		  {
+		    xlsx_file_relation *ptr;
+		    for (ptr = workbook->relation_first; ptr->next; ptr = ptr->next);
+		    ptr->next = rel;
+		  }
+		  else
+		    workbook->relation_first = rel;
+		}
+	    }
+	  else
+	    {
+	      if (relation.rid)
+		free (relation.rid);
+	      if (relation.filename)
+		free (relation.filename);
+	    }
+      }
+}
+
+static void
+do_parse_xlsx_worksheet_files (xlsx_workbook * workbook, unsigned char *buf,
+		      uint64_t size_buf)
+{
+/* parsing Styles.xml */
+    XML_Parser parser;
+    int done = 0;
+
+    parser = XML_ParserCreate (NULL);
+    if (!parser)
+      {
+	  workbook->error = 1;
+	  return;
+      }
+
+    XML_SetUserData (parser, workbook);
+    XML_SetElementHandler (parser, worksheet_file_start_tag, NULL);
+    XML_SetCharacterDataHandler (parser, xmlCharData);
+    if (!XML_Parse (parser, (char *) buf, size_buf, done))
+	workbook->error = 1;
+    XML_ParserFree (parser);
+}
+
+static void
+do_fetch_xlsx_worksheet_rels (unzFile uf, xlsx_workbook * workbook)
+{
+/* uncompressing Styles.xml */
+    int err;
+    char filename[256];
+    unz_file_info64 file_info;
+    uint64_t size_buf;
+    unsigned char *buf = NULL;
+    int is_open = 0;
+    uint64_t rd_cnt;
+    uint64_t unrd_cnt;
+
+    err = unzLocateFile (uf, workbook->WorksheetFileEntry, 0);
+    if (err != UNZ_OK)
+      {
+	  workbook->error = 1;
+	  goto skip;
+      }
+    err =
+	unzGetCurrentFileInfo64 (uf, &file_info, filename, 256, NULL, 0, NULL,
+				 0);
+    if (err != UNZ_OK)
+      {
+	  workbook->error = 1;
+	  goto skip;
+      }
+    size_buf = file_info.uncompressed_size;
+    buf = malloc (size_buf);
+    err = unzOpenCurrentFile (uf);
+    if (err != UNZ_OK)
+      {
+	  workbook->error = 1;
+	  goto skip;
+      }
+    is_open = 1;
+    rd_cnt = 0;
+    while (rd_cnt < size_buf)
+      {
+	  /* reading big chunks so to avoid large file issues */
+	  uint32_t max = 1000000000;	/* max chunk size */
+	  uint32_t len;
+	  unrd_cnt = size_buf - rd_cnt;
+	  if (unrd_cnt < max)
+	      len = unrd_cnt;
+	  else
+	      len = max;
+	  err = unzReadCurrentFile (uf, buf + rd_cnt, len);
+	  if (err < 0)
+	    {
+		workbook->error = 1;
+		goto skip;
+	    }
+	  rd_cnt += len;
+      }
+
+/* parsing workbook.xml.rels */
+    do_parse_xlsx_worksheet_files (workbook, buf, size_buf);
+
+  skip:
+    if (buf != NULL)
+	free (buf);
+    if (is_open)
+	unzCloseCurrentFile (uf);
+}
+
 FREEXL_DECLARE int
 freexl_open_xlsx (const char *path, const void **xl_handle)
 {
@@ -1497,6 +1804,17 @@ freexl_open_xlsx (const char *path, const void **xl_handle)
 		goto stop;
 	    }
       }
+    if (workbook->WorksheetFileEntry != NULL)
+      {
+	  /* parsing Styles.xml */
+	  do_fetch_xlsx_worksheet_rels (uf, workbook);
+	  if (workbook->error)
+	    {
+		destroy_workbook (workbook);
+		retval = FREEXL_INVALID_XLSX;
+		goto stop;
+	    }
+      }
     if (workbook->WorkbookZipEntry != NULL)
       {
 	  /* parsing Workbook.xml */
@@ -1512,7 +1830,7 @@ freexl_open_xlsx (const char *path, const void **xl_handle)
     while (worksheet != NULL)
       {
 	  /* parsing all Worksheets */
-	  do_fetch_worksheet (uf, worksheet);
+	  do_fetch_worksheet (uf, worksheet, workbook);
 	  if (worksheet->error)
 	    {
 		destroy_workbook (workbook);
