@@ -14,7 +14,7 @@ coverage-init:
 	lcov --directory src --capture --initial --output-file freexl_cov.info
 
 coverage::
-	lcov --rc lcov_branch_coverage=1 --directory src --output-file freexl_cov.info --capture
-	genhtml --rc lcov_branch_coverage=1 -o covresults freexl_cov.info
+	lcov --rc branch_coverage=1 --directory src --output-file freexl_cov.info --capture
+	genhtml --rc branch_coverage=1 -o covresults freexl_cov.info
 
 MOSTLYCLEANFILES = freexl_cov.info 
